@@ -2,16 +2,6 @@ fastapi
 uvicorn[standard]
 python-multipart
 python-dotenv
-requests
-
-# OCR
-easyocr
-PyMuPDF
-Pillow
-
-# Audio
-gtts
-
-# RAG & Knowledge Base
-faiss-cpu
-sentence-transformers
+requests # Still needed to call HF API and ML backend
+gtts     # Keep TTS here, it's light
+# REMOVE: easyocr, PyMuPDF, Pillow, faiss-cpu, sentence-transformers
