@@ -463,5 +463,6 @@ if __name__ == "__main__":
     mimetypes.add_type("application/javascript", ".js")
     mimetypes.add_type("text/css", ".css")
 
-    # Run the app
-    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 10000)), reload=True) # Use PORT env var if available
+    # ✅ IMPORTANT FIX: Use Render's dynamic port correctly
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("app:app", host="0.0.0.0", port=port)
