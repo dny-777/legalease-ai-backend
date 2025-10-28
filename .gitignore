@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+.env
+uploads/
+audio/
+data/
+*.faiss
+*.json # In kb/ - Check if index_mapping.json should be ignored or built on deploy
+desktop.ini

@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+requests
+
+# OCR
+easyocr
+PyMuPDF
+Pillow
+
+# Audio
+gtts
+
+# RAG & Knowledge Base
+faiss-cpu
+sentence-transformers
