@@ -457,12 +457,21 @@ async def chat(request: ChatRequest, http_request: Request):
         if isinstance(e, HTTPException): detail = e.detail
         raise HTTPException(status_code=500, detail=detail)
 
-# --- 6. MAIN EXECUTION ---
+import os
+import uvicorn
+import mimetypes
+
 if __name__ == "__main__":
-    # Ensure mimetypes are configured correctly
+    print("✅ Starting backend...")
+
+    # Fix for MIME types (optional but harmless)
     mimetypes.add_type("application/javascript", ".js")
     mimetypes.add_type("text/css", ".css")
 
-    # ✅ IMPORTANT FIX: Use Render's dynamic port correctly
-    port = int(os.environ.get("PORT", 10000))
+    # Ensure Render port binding
+    port = int(os.environ.get("PORT", 8000))
+    print(f"🚀 Running on port {port}")
+
+    # Launch Uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=port)
+
