@@ -35,6 +35,11 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- CREATE STATIC DIRS **BEFORE** APP MOUNT --- MOVED HERE ---
+os.makedirs("uploads", exist_ok=True)
+os.makedirs("audio", exist_ok=True)
+# -----------------------------------------------------------
+
 # --- NEW: Hugging Face API Config ---
 HF_API_TOKEN = os.getenv("HF_TOKEN")
 HF_HEADERS = {"Authorization": f"Bearer {HF_API_TOKEN}"}
@@ -68,35 +73,49 @@ def init_json_db(filepath: str, default_data):
 
 def save_upload_data(file_id, original_name, file_path, raw_text):
     try:
-        with open("data/uploads.json", "r+") as f:
-            data = json.load(f)
-            data[file_id] = {
-                "original_name": original_name,
-                "file_path": file_path,
-                "raw_text": raw_text,
-                "simplified_text": ""
-            }
-            f.seek(0)
-            json.dump(data, f, indent=4)
+        # Ensure data directory exists before trying to open the file
+        os.makedirs("data", exist_ok=True)
+        # Use 'a+' mode initially to create if not exists, then read/write
+        try:
+            with open("data/uploads.json", "r+") as f:
+                try:
+                    data = json.load(f)
+                    if not isinstance(data, dict): # Handle case where file exists but isn't a dict
+                         data = {}
+                except json.JSONDecodeError:
+                    data = {} # Start fresh if file is corrupt/empty
+                data[file_id] = {
+                    "original_name": original_name, "file_path": file_path,
+                    "raw_text": raw_text, "simplified_text": ""
+                }
+                f.seek(0)
+                f.truncate() # Clear before writing
+                json.dump(data, f, indent=4)
+        except FileNotFoundError: # Should ideally not happen with 'a+' but as fallback
+             with open("data/uploads.json", "w") as f:
+                 data = {}
+                 data[file_id] = {
+                    "original_name": original_name, "file_path": file_path,
+                    "raw_text": raw_text, "simplified_text": ""
+                 }
+                 json.dump(data, f, indent=4)
+
     except Exception as e:
         logger.error(f"Failed to save upload data: {e}")
 
+
 # --- CORRECTED TTS HELPER ---
-# Takes the gTTS language code (e.g., 'hi')
-# Returns the relative path like '/audio/uuid.mp3'
 def generate_tts(text: str, gtts_lang_code: str) -> Optional[str]:
     if not gtts_lang_code:
         logger.warning(f"No gTTS lang code provided, skipping TTS.")
         return None
     try:
-        # Using the tld='co.in' based on previous tests
         tts = gTTS(text=text, lang=gtts_lang_code, slow=False, tld='co.in')
         file_id = str(uuid.uuid4())
-        # Store only the relative path part
+        # Ensure audio directory exists
+        os.makedirs("audio", exist_ok=True)
         relative_file_path = f"audio/{file_id}.mp3"
-        # Save using the full path needed by the system
         tts.save(relative_file_path)
-        # Return the relative path prefixed with a '/' for URL construction
         return f"/{relative_file_path}"
     except Exception as e:
         logger.error(f"gTTS failed: {e}")
@@ -105,23 +124,33 @@ def generate_tts(text: str, gtts_lang_code: str) -> Optional[str]:
 # --- NEW: Hugging Face API Helper Function ---
 def hf_api_query(payload, model_url):
     """Generic function to query the HF Inference API."""
+    if not HF_API_TOKEN:
+         logger.error("Hugging Face API token (HF_TOKEN) is not set.")
+         raise HTTPException(status_code=500, detail="Server configuration error: Hugging Face API token not set.")
     try:
-        response = requests.post(model_url, headers=HF_HEADERS, json=payload)
-        response.raise_for_status() # Raise an error for bad responses (4xx or 5xx)
+        response = requests.post(model_url, headers=HF_HEADERS, json=payload, timeout=60) # Added timeout
+        response.raise_for_status()
         return response.json()
-    except requests.exceptions.HTTPError as errh:
-        logger.error(f"Http Error: {errh} for URL {model_url}")
-        detail_msg = errh.response.text
-        try:
-            detail_msg = errh.response.json() # Try parsing JSON error
-        except json.JSONDecodeError:
-            pass # Keep text if not JSON
-
-        if errh.response.status_code == 503 and "loading" in errh.response.text:
-            raise HTTPException(status_code=503, detail=f"Model is loading, please try again in a few seconds. Error: {detail_msg}")
-        raise HTTPException(status_code=errh.response.status_code, detail=f"Hugging Face API error: {detail_msg}")
-    except Exception as e:
-        logger.error(f"Hugging Face query failed: {e}")
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout connecting to Hugging Face API: {model_url}")
+        raise HTTPException(status_code=504, detail="Hugging Face API request timed out.")
+    except requests.exceptions.RequestException as errh: # Broader exception for network issues
+        logger.error(f"Hugging Face API request error: {errh} for URL {model_url}")
+        detail_msg = str(errh)
+        status_code = 500 # Default internal server error
+        # Try to get specific details if it was an HTTP error
+        if hasattr(errh, 'response') and errh.response is not None:
+             status_code = errh.response.status_code
+             detail_msg = errh.response.text
+             try:
+                 detail_msg = errh.response.json()
+             except json.JSONDecodeError:
+                 pass
+             if status_code == 503 and "loading" in errh.response.text.lower():
+                  raise HTTPException(status_code=503, detail=f"Model is loading, please try again. Error: {detail_msg}")
+        raise HTTPException(status_code=status_code, detail=f"Hugging Face API error: {detail_msg}")
+    except Exception as e: # Catch other potential errors
+        logger.error(f"Unexpected error during Hugging Face query: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to query Hugging Face: {str(e)}")
 
 
@@ -130,9 +159,7 @@ def hf_api_query(payload, model_url):
 async def lifespan(app: FastAPI):
     logger.info("Application startup...")
 
-    # 1. Create dummy files & folders
-    os.makedirs("uploads", exist_ok=True)
-    os.makedirs("audio", exist_ok=True)
+    # 1. Create dummy data/kb files & folders (uploads/audio moved outside)
     os.makedirs("data", exist_ok=True)
     os.makedirs("kb", exist_ok=True)
     init_json_db("data/uploads.json", {})
@@ -142,54 +169,79 @@ async def lifespan(app: FastAPI):
 
     # 2. Load EasyOCR (local, free)
     logger.info("Loading EasyOCR model...")
-    models['ocr_reader'] = easyocr.Reader(['en', 'hi', 'mr'], gpu=False)
-    logger.info("EasyOCR model loaded.")
+    try:
+        models['ocr_reader'] = easyocr.Reader(['en', 'hi', 'mr'], gpu=False) # Specify CPU explicitly
+        logger.info("EasyOCR model loaded successfully.")
+    except Exception as e:
+         logger.error(f"Failed to load EasyOCR model: {e}", exc_info=True)
+         # Optionally raise error or continue without OCR
 
     # 3. Load RAG models (local, free)
     try:
         if not os.path.exists("kb/index.faiss"):
             logger.warning("FAISS index not found. Running build_kb...")
-            from build_kb import build_kb
-            build_kb()
+            # Ensure build_kb exists and handles its own errors
+            try:
+                from build_kb import build_kb
+                build_kb()
+            except ImportError:
+                 logger.error("build_kb.py not found or cannot be imported.")
+            except Exception as build_e:
+                 logger.error(f"Error running build_kb: {build_e}", exc_info=True)
 
-        logger.info("Loading SentenceTransformer model...")
-        models['st_model'] = SentenceTransformer('all-MiniLM-L6-v2')
-        logger.info("Loading FAISS index...")
-        models['faiss_index'] = faiss.read_index("kb/index.faiss")
+        # Check again if index exists before trying to load
+        if os.path.exists("kb/index.faiss") and os.path.exists("kb/index_mapping.json") and os.path.exists("kb/kb.json"):
+            logger.info("Loading SentenceTransformer model...")
+            models['st_model'] = SentenceTransformer('all-MiniLM-L6-v2')
+            logger.info("Loading FAISS index...")
+            models['faiss_index'] = faiss.read_index("kb/index.faiss")
 
-        with open("kb/kb.json", "r", encoding="utf-8") as f:
-            models['kb_data_map'] = {item['id']: item['text'] for item in json.load(f)}
-        with open("kb/index_mapping.json", "r") as f:
-            models['index_mapping'] = {int(k): v for k, v in json.load(f).items()}
+            with open("kb/kb.json", "r", encoding="utf-8") as f:
+                models['kb_data_map'] = {item['id']: item['text'] for item in json.load(f)}
+            with open("kb/index_mapping.json", "r") as f:
+                models['index_mapping'] = {int(k): v for k, v in json.load(f).items()}
 
-        logger.info("All RAG models loaded successfully.")
+            logger.info("All RAG models loaded successfully.")
+        else:
+             logger.error("One or more RAG files (index, mapping, kb.json) are missing after build attempt. Chat functionality might be limited.")
+
     except Exception as e:
-        logger.error(f"Failed to load RAG models: {e}")
+        logger.error(f"Failed to load RAG models during startup: {e}", exc_info=True)
+        # Decide if the app should fail completely or continue with limited functionality
 
-    yield
+    yield # App runs here
 
     # --- Shutdown ---
     logger.info("Application shutdown...")
-    models.clear()
+    models.clear() # Clear models from memory
 
 # --- 4. FASTAPI APP INITIALIZATION ---
+# Initialize AFTER creating directories needed for mounting
 app = FastAPI(
     title="LegalEase AI API (100% Free)",
     description="Full-stack API for multilingual legal assistance using Hugging Face.",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan # Use the lifespan context manager
 )
+
+# --- Mount static directories AFTER app initialization ---
+# Ensure these directories exist before mounting
+try:
+    app.mount("/audio", StaticFiles(directory="audio"), name="audio")
+    app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+except RuntimeError as mount_error:
+     logger.error(f"Failed to mount static directories: {mount_error}. Ensure 'audio' and 'uploads' folders exist.")
+     # Decide if this is a fatal error for your application
+
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # Allow all origins for simplicity in hackathon
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"], # Allow all methods
+    allow_headers=["*"], # Allow all headers
 )
 
-app.mount("/audio", StaticFiles(directory="audio"), name="audio")
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # --- 5. API ENDPOINTS (NOW 100% FREE) ---
 
@@ -202,15 +254,24 @@ async def read_root():
 async def upload_and_ocr(file: UploadFile = File(...)):
     reader = models.get('ocr_reader')
     if not reader:
-        raise HTTPException(status_code=503, detail="OCR service is not ready.")
+        raise HTTPException(status_code=503, detail="OCR service is not ready or failed to load.")
 
     file_id = str(uuid.uuid4())
-    file_extension = file.filename.split('.')[-1].lower()
+    # Sanitize filename slightly - remove potential path traversal chars
+    safe_filename = os.path.basename(file.filename or f"{file_id}_upload")
+    file_extension = safe_filename.split('.')[-1].lower() if '.' in safe_filename else ''
     file_path = f"uploads/{file_id}.{file_extension}"
 
+    # Ensure uploads directory exists
+    os.makedirs("uploads", exist_ok=True)
+
     contents = await file.read()
-    with open(file_path, "wb") as f:
-        f.write(contents)
+    try:
+        with open(file_path, "wb") as f:
+            f.write(contents)
+    except IOError as e:
+         logger.error(f"Failed to save uploaded file {file_path}: {e}")
+         raise HTTPException(status_code=500, detail="Failed to save uploaded file.")
 
     raw_text = ""
     try:
@@ -219,177 +280,107 @@ async def upload_and_ocr(file: UploadFile = File(...)):
             for page_num in range(len(doc)):
                 page = doc.load_page(page_num)
                 pix = page.get_pixmap()
-                img_bytes = pix.tobytes("png")
+                img_bytes = pix.tobytes("png") # Ensure format is compatible with easyocr
+                # Use easyocr directly on bytes
                 result = reader.readtext(img_bytes)
                 page_text = ' '.join([text[1] for text in result])
                 raw_text += page_text + "\n\n"
             doc.close()
         elif file_extension in ['png', 'jpg', 'jpeg']:
+            # Read directly from saved file path
             result = reader.readtext(file_path)
             raw_text = ' '.join([text[1] for text in result])
         else:
-            raise HTTPException(status_code=400, detail="Unsupported file type.")
+            # Clean up the invalid file before raising error
+            try: os.remove(file_path)
+            except OSError: pass
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: .{file_extension}")
 
-        raw_text = ' '.join(raw_text.split())
-        save_upload_data(file_id, file.filename, file_path, raw_text)
-        return UploadOCRResponse(file_id=file_id, file_name=file.filename, raw_text=raw_text)
+        raw_text = ' '.join(raw_text.split()) # Clean multiple whitespaces
+        save_upload_data(file_id, safe_filename, file_path, raw_text)
+        return UploadOCRResponse(file_id=file_id, file_name=safe_filename, raw_text=raw_text)
 
     except Exception as e:
-        logger.error(f"OCR processing failed: {e}")
+        logger.error(f"OCR processing failed for {file_path}: {e}", exc_info=True)
+        # Clean up the file if processing failed
+        try: os.remove(file_path)
+        except OSError: pass
         raise HTTPException(status_code=500, detail=f"OCR processing failed: {str(e)}")
 
 # === ROUTE 2: SIMPLIFY (FREE) ===
 @app.post("/api/simplify", response_model=SimplifyResponse, tags=["NLP"])
 async def simplify_text(request: TextRequest):
-    if not HF_API_TOKEN:
-        raise HTTPException(status_code=500, detail="Hugging Face API token not set.")
-
     payload = {"inputs": f"summarize: {request.text}"}
-    # Using distilbart as t5-small had issues before
     model_url = f"{HF_API_BASE_URL}sshleifer/distilbart-cnn-12-6"
-
     response_data = hf_api_query(payload, model_url)
-
-    # Check if response is a list and not empty
     if isinstance(response_data, list) and len(response_data) > 0:
         simplified = response_data[0].get('summary_text')
         if simplified is not None:
              return SimplifyResponse(simplified_text=simplified)
-
     logger.error(f"Unexpected API response format for simplify: {response_data}")
     raise HTTPException(status_code=500, detail="API response format invalid or empty.")
-
 
 # === ROUTE 3: TRANSLATE (FREE - Using mBART) --- UPDATED --- ===
 @app.post("/api/translate", response_model=TranslateResponse, tags=["NLP"])
 async def translate_text(request: LanguageRequest):
-    if not HF_API_TOKEN:
-        raise HTTPException(status_code=500, detail="Hugging Face API token not set.")
-
     lang_details = LANG_CODES.get(request.target_language)
     if not lang_details or not lang_details.get("mbart"):
          raise HTTPException(status_code=400, detail=f"Language '{request.target_language}' not supported for mBART translation.")
-
-    mbart_lang_code = lang_details["mbart"] # e.g., "hi_IN", "mr_IN"
-    model_name = "facebook/mbart-large-50-many-to-many-mmt" # Multilingual model
+    mbart_lang_code = lang_details["mbart"]
+    model_name = "facebook/mbart-large-50-many-to-many-mmt"
     model_url = f"{HF_API_BASE_URL}{model_name}"
-
-    # mBART requires specifying source and target language codes in parameters
-    payload = {
-        "inputs": request.text,
-        "parameters": {
-            "src_lang": "en_XX", # Source is English
-            "tgt_lang": mbart_lang_code # Target language code from LANG_CODES
-        }
-    }
-
+    payload = { "inputs": request.text, "parameters": { "src_lang": "en_XX", "tgt_lang": mbart_lang_code } }
     logger.info(f"Calling mBART for {request.target_language} ({mbart_lang_code})")
     response_data = hf_api_query(payload, model_url)
-
-    # Check response format
     if isinstance(response_data, list) and len(response_data) > 0:
         translated = response_data[0].get('translation_text')
         if translated is not None:
              return TranslateResponse(translated_text=translated)
-
     logger.error(f"Unexpected API response format for translate: {response_data}")
     raise HTTPException(status_code=500, detail="Translation API response format invalid or empty.")
-
 
 # === ROUTE 4: TEXT-TO-SPEECH (TTS) --- UPDATED gTTS code lookup --- ===
 @app.post("/api/tts", response_model=TTSResponse, tags=["Audio"])
 async def text_to_speech(request: TTSRequest, http_request: Request):
-    # --- UPDATED --- Get gTTS code from the nested dictionary
     lang_details = LANG_CODES.get(request.language)
     gtts_lang_code = lang_details.get("gtts") if lang_details else None
-
     if not gtts_lang_code:
          raise HTTPException(status_code=400, detail=f"Language '{request.language}' not supported for TTS.")
-
-    # generate_tts now takes gtts_lang_code and returns relative path
     relative_path = generate_tts(request.text, gtts_lang_code)
     if not relative_path:
-        # generate_tts logs the error, raise generic error here
         raise HTTPException(status_code=500, detail="TTS generation failed.")
-
-    # Construct the full URL using the server's base URL
     base_url = str(http_request.base_url).rstrip('/')
-    audio_url = f"{base_url}{relative_path}" # e.g. "http://127.0.0.1:10000" + "/audio/uuid.mp3"
-
+    audio_url = f"{base_url}{relative_path}"
     return TTSResponse(audio_url=audio_url)
 
 # === ROUTE 5: SPEECH-TO-TEXT (STT) (FREE) --- DISABLED DUE TO API UNRELIABILITY --- ===
 # @app.post("/api/stt", response_model=STTResponse, tags=["Audio"])
 # async def speech_to_text(file: UploadFile = File(...)):
-#     if not HF_API_TOKEN:
-#         raise HTTPException(status_code=500, detail="Hugging Face API token not set.")
-#
-#     # Tried openai/whisper-base, openai/whisper-tiny, facebook/wav2vec2-base-960h
-#     # All failed with 404 on free tier during testing.
-#     model_url = f"{HF_API_BASE_URL}facebook/wav2vec2-base-960h"
-#
-#     try:
-#         audio_data = await file.read()
-#         headers_stt = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-#
-#         response = requests.post(model_url, headers=headers_stt, data=audio_data)
-#         response.raise_for_status()
-#         response_data = response.json()
-#
-#         # Wav2Vec2 might return 'text' or 'error'
-#         text = response_data.get("text")
-#         error = response_data.get("error")
-#
-#         if error:
-#              logger.error(f"Wav2Vec2 API returned an error: {error}")
-#              if isinstance(error, str) and "loading" in error.lower():
-#                   raise HTTPException(status_code=503, detail=f"STT model is currently loading, please try again. Error: {error}")
-#              raise HTTPException(status_code=500, detail=f"STT API returned an error: {error}")
-#
-#         if text is None:
-#              logger.error(f"STT API response missing 'text' key: {response_data}")
-#              raise HTTPException(status_code=500, detail="API response was valid but had no text.")
-#
-#         transcribed_text = text.strip()
-#         return STTResponse(transcribed_text=transcribed_text)
-#
-#     except requests.exceptions.HTTPError as errh:
-#         logger.error(f"Http Error during STT: {errh} for URL {model_url}")
-#         detail_msg = errh.response.text
-#         try:
-#             detail_msg = errh.response.json()
-#         except json.JSONDecodeError:
-#              pass
-#
-#         if errh.response.status_code == 503 and "loading" in errh.response.text:
-#             raise HTTPException(status_code=503, detail=f"STT model is currently loading, please try again. Error: {detail_msg}")
-#         raise HTTPException(status_code=errh.response.status_code, detail=f"Hugging Face STT API error: {detail_msg}")
-#     except Exception as e:
-#         logger.error(f"STT processing failed: {e}")
-#         raise HTTPException(status_code=500, detail=f"Speech-to-text failed: {str(e)}")
+#     # ... (code remains commented out) ...
+#     pass # Add pass to make the commented function valid Python syntax if uncommented partially
 
 
 # === ROUTE 6: CHAT (THE BRAIN) (FREE) --- UPDATED --- ===
 @app.post("/api/chat", response_model=ChatResponse, tags=["Chat"])
 async def chat(request: ChatRequest, http_request: Request):
-    if 'st_model' not in models:
+    st_model = models.get('st_model')
+    index = models.get('faiss_index')
+    mapping = models.get('index_mapping')
+    kb_data = models.get('kb_data_map')
+
+    if not all([st_model, index, mapping, kb_data]):
+        logger.error("RAG models not loaded correctly. Cannot process chat request.")
         raise HTTPException(status_code=503, detail="Chat service (RAG models) is not ready.")
 
     try:
-        # --- 1. RAG: Get Knowledge Base Context (Same as before) ---
-        st_model = models['st_model']
-        index = models['faiss_index']
-        mapping = models['index_mapping']
-        kb_data = models['kb_data_map']
-
+        # --- 1. RAG: Get Knowledge Base Context ---
         query_embedding = st_model.encode([request.query])
-        k = 1 # Find the single best match
+        k = 1
         distances, indices = index.search(query_embedding, k)
-
         best_match_text = "I'm sorry, I don't have specific information on that in my knowledge base."
-        if indices.size > 0 and indices[0][0] != -1: # Check if index is valid
+        if indices.size > 0 and indices[0][0] != -1:
             faiss_index = indices[0][0]
-            original_id = mapping.get(faiss_index) # Use the correct index
+            original_id = mapping.get(faiss_index)
             if original_id:
                 best_match_text = kb_data.get(original_id, best_match_text)
             else:
@@ -397,90 +388,80 @@ async def chat(request: ChatRequest, http_request: Request):
         else:
              logger.info(f"No relevant KB entry found for query: {request.query}")
 
-
         # --- 2. Build Answer (Translate if needed, using mBART) ---
-        answer_text = best_match_text # Start with the English KB text
-
+        answer_text = best_match_text
         if request.language != "English":
             lang_details = LANG_CODES.get(request.language)
-            # Check if language and mbart code exist
             if lang_details and lang_details.get("mbart"):
                 mbart_lang_code = lang_details["mbart"]
                 trans_model_name = "facebook/mbart-large-50-many-to-many-mmt"
                 trans_model_url = f"{HF_API_BASE_URL}{trans_model_name}"
-                trans_payload = {
-                    "inputs": best_match_text,
-                    "parameters": {
-                        "src_lang": "en_XX",
-                        "tgt_lang": mbart_lang_code
-                    }
-                }
+                trans_payload = { "inputs": best_match_text, "parameters": { "src_lang": "en_XX", "tgt_lang": mbart_lang_code } }
                 try:
                     logger.info(f"Translating chat answer to {request.language} ({mbart_lang_code}) using mBART...")
                     trans_response = hf_api_query(trans_payload, trans_model_url)
-                    # Check response format
                     if isinstance(trans_response, list) and len(trans_response) > 0:
                         translated_answer = trans_response[0].get('translation_text')
                         if translated_answer:
-                            answer_text = translated_answer # Update answer_text if translation succeeds
+                            answer_text = translated_answer
                         else:
-                            logger.warning(f"mBART translation to {request.language} succeeded but response was empty. Using English.")
+                            logger.warning(f"mBART translation succeeded but response empty. Using English.")
                     else:
-                        logger.warning(f"Unexpected mBART translation response format: {trans_response}. Using English.")
+                        logger.warning(f"Unexpected mBART translation response. Using English.")
                 except Exception as e:
-                    # Log the specific error from hf_api_query (which raises HTTPException)
-                    logger.warning(f"mBART Translation to {request.language} failed: {e}. Using English answer.")
+                    logger.warning(f"mBART Translation failed: {e}. Using English answer.")
             else:
-                 logger.warning(f"Language {request.language} not supported for mBART translation. Using English.")
+                 logger.warning(f"Language {request.language} not supported for mBART. Using English.")
         else:
              logger.info("Chat language is English, skipping translation.")
 
-
         # --- 3. Generate Audio for Answer ---
-        # --- UPDATED --- Get gTTS code from the nested dictionary
-        gtts_lang_code = LANG_CODES.get(request.language, {}).get("gtts", "en") # Default to 'en' if language not found
-        relative_audio_path = generate_tts(answer_text, gtts_lang_code) # Pass gtts_lang_code
+        gtts_lang_code = LANG_CODES.get(request.language, {}).get("gtts", "en")
+        relative_audio_path = generate_tts(answer_text, gtts_lang_code)
         audio_url = None
         if relative_audio_path:
             base_url = str(http_request.base_url).rstrip('/')
             audio_url = f"{base_url}{relative_audio_path}"
 
-
         # --- 4. Save Chat & Return ---
         try:
-            with open("data/cases.json", "r+") as f:
-                # Read existing history, handle potential empty file
-                try:
-                    history = json.load(f)
-                    if not isinstance(history, list): history = [] # Ensure it's a list
-                except json.JSONDecodeError:
-                    history = [] # Start fresh if file is corrupt/empty
-
-                history.append(
-                    {"query": request.query, "answer": answer_text, "file_id": request.file_id, "audio_url": audio_url}
-                )
-                f.seek(0) # Go to start of file
-                f.truncate() # Clear existing content before writing
-                json.dump(history, f, indent=4)
+            # Ensure data directory exists
+            os.makedirs("data", exist_ok=True)
+            # Use 'a+' mode initially, then read/write carefully
+            try:
+                with open("data/cases.json", "r+") as f:
+                    try:
+                        history = json.load(f)
+                        if not isinstance(history, list): history = []
+                    except json.JSONDecodeError:
+                        history = []
+                    history.append({ "query": request.query, "answer": answer_text, "file_id": request.file_id, "audio_url": audio_url })
+                    f.seek(0)
+                    f.truncate()
+                    json.dump(history, f, indent=4)
+            except FileNotFoundError:
+                 with open("data/cases.json", "w") as f:
+                     history = [{ "query": request.query, "answer": answer_text, "file_id": request.file_id, "audio_url": audio_url }]
+                     json.dump(history, f, indent=4)
         except Exception as e:
-            logger.warning(f"Failed to save chat history: {e}")
+            logger.error(f"Failed to save chat history: {e}", exc_info=True) # Log full traceback
 
         return ChatResponse(
-            answer_text=answer_text,
-            audio_url=audio_url,
-            file_id=request.file_id,
-            query=request.query
+            answer_text=answer_text, audio_url=audio_url,
+            file_id=request.file_id, query=request.query
         )
 
     except Exception as e:
-        logger.error(f"Chat processing failed unexpectedly: {e}")
-        # Add more specific error detail if possible
+        logger.error(f"Chat processing failed unexpectedly: {e}", exc_info=True)
         detail = f"Chat processing failed: {str(e)}"
-        if isinstance(e, HTTPException): # Propagate HTTPException details
-             detail = e.detail
+        if isinstance(e, HTTPException): detail = e.detail
         raise HTTPException(status_code=500, detail=detail)
 
 # --- 6. MAIN EXECUTION ---
 if __name__ == "__main__":
+    # Ensure mimetypes are configured correctly
     mimetypes.add_type("application/javascript", ".js")
-    uvicorn.run("app:app", host="0.0.0.0", port=10000, reload=True)
+    mimetypes.add_type("text/css", ".css")
+
+    # Run the app
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 10000)), reload=True) # Use PORT env var if available
