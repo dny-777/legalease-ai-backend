@@ -38,11 +38,19 @@ os.makedirs("audio", exist_ok=True) # Only audio needed now
 # models = {}
 
 # Language codes (Keep this)
+# --- UPDATED LANG_CODES (Backend Source) ---
+# Format: "LanguageName": {"gtts": "gtts_code", "mbart": "mbart_code"}
 LANG_CODES = {
     "English":   {"gtts": "en", "mbart": "en_XX"},
     "Hindi":     {"gtts": "hi", "mbart": "hi_IN"},
     "Marathi":   {"gtts": "mr", "mbart": "mr_IN"},
-    # ... keep other languages ...
+    "Tamil":     {"gtts": "ta", "mbart": "ta_IN"},
+    "Telugu":    {"gtts": "te", "mbart": "te_IN"},
+    "Bengali":   {"gtts": "bn", "mbart": "bn_IN"},
+    "Gujarati":  {"gtts": "gu", "mbart": "gu_IN"},
+    "Kannada":   {"gtts": "kn", "mbart": "kn_IN"},
+    "Malayalam": {"gtts": "ml", "mbart": "ml_IN"},
+    "Punjabi":   {"gtts": "pa", "mbart": "pa_IN"}
 }
 
 def init_json_db(filepath: str, default_data):
